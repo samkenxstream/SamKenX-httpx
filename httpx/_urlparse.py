@@ -253,12 +253,21 @@ def urlparse(url: str = "", **kwargs: typing.Optional[str]) -> ParseResult:
     if has_authority:
         path = normalize_path(path)
 
-    parsed_path: str = quote(path, safe=SUB_DELIMS + ":@/")
+    # The GEN_DELIMS set is... : / ? # [ ] @
+    # These do not need to be percent-quoted unless they serve as delimiters for the
+    # specific component.
+
+    # For 'path' we need to drop ? and # from the GEN_DELIMS set.
+    parsed_path: str = quote(path, safe=SUB_DELIMS + ":/[]@")
+    # For 'query' we need to drop '#' from the GEN_DELIMS set.
+    # We also exclude '/' because it is more robust to replace it with a percent
+    # encoding despite it not being a requirement of the spec.
     parsed_query: typing.Optional[str] = (
-        None if query is None else quote(query, safe=SUB_DELIMS + "/?")
+        None if query is None else quote(query, safe=SUB_DELIMS + ":?[]@")
     )
+    # For 'fragment' we can include all of the GEN_DELIMS set.
     parsed_fragment: typing.Optional[str] = (
-        None if fragment is None else quote(fragment, safe=SUB_DELIMS + "/?")
+        None if fragment is None else quote(fragment, safe=SUB_DELIMS + ":/?#[]@")
     )
 
     # The parsed ASCII bytestrings are our canonical form.
@@ -287,7 +296,7 @@ def encode_host(host: str) -> str:
         try:
             ipaddress.IPv4Address(host)
         except ipaddress.AddressValueError:
-            raise InvalidURL("Invalid IPv4 address")
+            raise InvalidURL(f"Invalid IPv4 address: {host!r}")
         return host
 
     elif IPv6_STYLE_HOSTNAME.match(host):
@@ -302,7 +311,7 @@ def encode_host(host: str) -> str:
         try:
             ipaddress.IPv6Address(host[1:-1])
         except ipaddress.AddressValueError:
-            raise InvalidURL("Invalid IPv6 address")
+            raise InvalidURL(f"Invalid IPv6 address: {host!r}")
         return host[1:-1]
 
     elif host.isascii():
@@ -317,7 +326,7 @@ def encode_host(host: str) -> str:
     try:
         return idna.encode(host.lower()).decode("ascii")
     except idna.IDNAError:
-        raise InvalidURL("Invalid IDNA hostname")
+        raise InvalidURL(f"Invalid IDNA hostname: {host!r}")
 
 
 def normalize_port(
@@ -338,7 +347,7 @@ def normalize_port(
     try:
         port_as_int = int(port)
     except ValueError:
-        raise InvalidURL("Invalid port")
+        raise InvalidURL(f"Invalid port: {port!r}")
 
     # See https://url.spec.whatwg.org/#url-miscellaneous
     default_port = {"ftp": 21, "http": 80, "https": 443, "ws": 80, "wss": 443}.get(
@@ -399,7 +408,7 @@ def normalize_path(path: str) -> str:
 
 def percent_encode(char: str) -> str:
     """
-    Replace every character in a string with the percent-encoded representation.
+    Replace a single character with the percent-encoded representation.
 
     Characters outside the ASCII range are represented with their a percent-encoded
     representation of their UTF-8 byte sequence.
@@ -411,13 +420,29 @@ def percent_encode(char: str) -> str:
     return "".join([f"%{byte:02x}" for byte in char.encode("utf-8")]).upper()
 
 
-def quote(string: str, safe: str = "/") -> str:
-    NON_ESCAPED_CHARS = UNRESERVED_CHARACTERS + safe
-    if string.count("%") == len(PERCENT_ENCODED_REGEX.findall(string)):
-        # If all occurances of '%' are valid '%xx' escapes, then treat
-        # percent as a non-escaping character.
-        NON_ESCAPED_CHARS += "%"
+def is_safe(string: str, safe: str = "/") -> bool:
+    """
+    Determine if a given string is already quote-safe.
+    """
+    NON_ESCAPED_CHARS = UNRESERVED_CHARACTERS + safe + "%"
 
+    # All characters must already be non-escaping or '%'
+    for char in string:
+        if char not in NON_ESCAPED_CHARS:
+            return False
+
+    # Any '%' characters must be valid '%xx' escape sequences.
+    return string.count("%") == len(PERCENT_ENCODED_REGEX.findall(string))
+
+
+def quote(string: str, safe: str = "/") -> str:
+    """
+    Use percent-encoding to quote a string if required.
+    """
+    if is_safe(string, safe=safe):
+        return string
+
+    NON_ESCAPED_CHARS = UNRESERVED_CHARACTERS + safe
     return "".join(
         [char if char in NON_ESCAPED_CHARS else percent_encode(char) for char in string]
     )
@@ -429,11 +454,11 @@ def urlencode(items: typing.List[typing.Tuple[str, str]]) -> str:
     #
     # https://github.com/python/cpython/blob/b2f7b2ef0b5421e01efb8c7bee2ef95d3bab77eb/Lib/urllib/parse.py#L926
     #
-    # Note that we use '%20' encoding for spaces, and treat '/' as a safe
-    # character. This means our query params have the same escaping as other
-    # characters in the URL path. This is slightly different to `requests`,
-    # but is the behaviour that browsers use.
+    # Note that we use '%20' encoding for spaces. and '%2F  for '/'.
+    # This is slightly different than `requests`, but is the behaviour that browsers use.
     #
-    # See https://github.com/encode/httpx/issues/2536 and
-    # https://docs.python.org/3/library/urllib.parse.html#urllib.parse.urlencode
-    return "&".join([quote(k) + "=" + quote(v) for k, v in items])
+    # See
+    # - https://github.com/encode/httpx/issues/2536
+    # - https://github.com/encode/httpx/issues/2721
+    # - https://docs.python.org/3/library/urllib.parse.html#urllib.parse.urlencode
+    return "&".join([quote(k, safe="") + "=" + quote(v, safe="") for k, v in items])
